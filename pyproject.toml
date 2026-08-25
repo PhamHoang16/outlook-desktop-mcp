@@ -1,9 +1,10 @@
 [project]
 name = "outlook-desktop-mcp"
-version = "0.3.0"
+version = "0.5.0"
 description = "Outlook Desktop as an MCP server — Windows (COM) and macOS (AppleScript). No Graph API, no Entra app registration — just your local Outlook."
 readme = "README.md"
-requires-python = ">=3.12"
+license = { text = "AGPL-3.0-only" }
+requires-python = ">=3.10"
 authors = [
     { name = "Andreas Martin Aanerud", email = "aaanerud@microsoft.com" },
 ]
@@ -15,13 +16,26 @@ classifiers = [
     "Intended Audience :: Developers",
     "Operating System :: Microsoft :: Windows",
     "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Communications :: Email",
     "Topic :: Office/Business :: Office Suites",
 ]
 dependencies = [
     "pywin32>=310; sys_platform == 'win32'",
-    "mcp[cli]>=1.26.0",
+    "mcp>=1.26.0",
+]
+
+[project.optional-dependencies]
+# Only needed when using the bundled mcp CLI tools (`mcp dev`, etc.)
+cli = ["mcp[cli]>=1.26.0"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pip-audit>=2.7.0",
+    "bandit[toml]>=1.8.0",
 ]
 
 [project.urls]
@@ -38,3 +52,15 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/outlook_desktop_mcp"]
+
+[tool.bandit]
+exclude_dirs = ["tests"]
+# COM/AppleScript code intentionally skips broken items (B110/B112).
+skips = ["B110", "B112"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests/unit"]
+markers = [
+    "integration: requires a running Outlook and RUN_OUTLOOK_INTEGRATION=1",
+]

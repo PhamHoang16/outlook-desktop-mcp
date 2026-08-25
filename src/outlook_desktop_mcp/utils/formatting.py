@@ -108,3 +108,35 @@ def format_task_full(item, body_max_length: int = 5000) -> dict:
         str(item.DateCompleted) if item.Complete else None
     )
     return result
+
+
+# --- Contact formatting ---
+
+
+def _contact_field(item, *attr_names: str, default: str = "") -> str:
+    for name in attr_names:
+        try:
+            val = getattr(item, name, None)
+            if val is not None and str(val).strip():
+                return str(val).strip()
+        except Exception:
+            continue
+    return default
+
+
+def format_contact_summary(item) -> dict:
+    """Extract key fields from an Outlook ContactItem into a dict."""
+    email = _contact_field(
+        item, "Email1Address", "Email2Address", "Email3Address"
+    )
+    phone = _contact_field(
+        item, "MobileTelephoneNumber", "BusinessTelephoneNumber", "HomeTelephoneNumber"
+    )
+    return {
+        "entry_id": getattr(item, "EntryID", "") or "",
+        "full_name": _contact_field(item, "FullName", "FileAs", default="(no name)"),
+        "email": email,
+        "company": _contact_field(item, "CompanyName"),
+        "phone": phone,
+        "job_title": _contact_field(item, "JobTitle"),
+    }

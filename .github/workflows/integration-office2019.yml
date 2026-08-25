@@ -1,0 +1,122 @@
+# Functional tests against real Classic Outlook (Office 2019 / 16.0).
+#
+# GitHub-hosted windows-latest does NOT include Microsoft Office. This workflow
+# targets a self-hosted Windows runner with Classic Outlook installed.
+# See docs/office2019-self-hosted-runner.md for setup.
+name: Integration (Office 2019 / self-hosted)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to test (branch, tag, or SHA). Empty = default branch.
+        required: false
+        default: ""
+      pytest_args:
+        description: Extra pytest arguments (e.g. -v --tb=short)
+        required: false
+        default: "-q"
+  # Optional: enable after a self-hosted runner is online (avoid a permanently queued job).
+  # push:
+  #   branches: [main]
+  #   paths:
+  #     - ".github/workflows/integration-office2019.yml"
+
+# Avoid overlapping runs on the same self-hosted machine.
+concurrency:
+  group: integration-office2019-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Informational only — always runs on GitHub-hosted Windows.
+  preflight:
+    name: Preflight (hosted — no Office)
+    runs-on: windows-latest
+    steps:
+      - name: Explain runner requirement
+        shell: pwsh
+        run: |
+          Write-Host "::notice title=Self-hosted runner required::"
+          Write-Host "GitHub-hosted windows-latest does not ship Microsoft Office."
+          Write-Host "Register a self-hosted runner with labels: self-hosted, Windows, outlook-office2019"
+          Write-Host "See docs/office2019-self-hosted-runner.md"
+          $paths = @(
+            "${env:ProgramFiles}\Microsoft Office\root\Office16\OUTLOOK.EXE",
+            "${env:ProgramFiles(x86)}\Microsoft Office\root\Office16\OUTLOOK.EXE",
+            "${env:ProgramFiles}\Microsoft Office\Office16\OUTLOOK.EXE"
+          )
+          $found = $paths | Where-Object { Test-Path $_ }
+          if ($found) {
+            Write-Host "Unexpected: OUTLOOK.EXE found on hosted runner: $found"
+          } else {
+            Write-Host "Confirmed: OUTLOOK.EXE not present on this hosted runner (expected)."
+          }
+
+  integration:
+    name: Outlook integration (self-hosted)
+    needs: preflight
+    runs-on: [self-hosted, Windows, outlook-office2019]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package and pywin32
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m pywin32_postinstall -install
+
+      - name: Verify Classic Outlook is installed
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "${env:ProgramFiles}\Microsoft Office\root\Office16\OUTLOOK.EXE",
+            "${env:ProgramFiles(x86)}\Microsoft Office\root\Office16\OUTLOOK.EXE",
+            "${env:ProgramFiles}\Microsoft Office\Office16\OUTLOOK.EXE"
+          )
+          $outlook = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $outlook) {
+            Write-Error "OUTLOOK.EXE not found. Install Office 2019 Classic Outlook on this runner."
+          }
+          Write-Host "Using Outlook: $outlook"
+          $ver = (Get-Item $outlook).VersionInfo.ProductVersion
+          Write-Host "ProductVersion: $ver"
+
+      - name: Smoke-test Outlook COM
+        shell: pwsh
+        run: |
+          $ol = New-Object -ComObject Outlook.Application
+          try {
+            $ns = $ol.GetNamespace("MAPI")
+            Write-Host "COM OK. Default store:" $ns.DefaultStore.DisplayName
+          } finally {
+            $ol.Quit()
+            [System.Runtime.InteropServices.Marshal]::ReleaseComObject($ol) | Out-Null
+          }
+
+      - name: Run Outlook integration tests
+        shell: pwsh
+        env:
+          RUN_OUTLOOK_INTEGRATION: "1"
+        run: |
+          python -m pytest `
+            tests/contacts_mcp_test.py `
+            tests/contacts_com_test.py `
+            tests/drafts_mcp_test.py `
+            ${{ inputs.pytest_args || '-q' }} `
+            --junitxml=integration-junit.xml
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-office2019-junit
+          path: integration-junit.xml
+          if-no-files-found: ignore

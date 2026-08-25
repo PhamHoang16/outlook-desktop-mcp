@@ -38,8 +38,8 @@ When the server starts, it checks which operating system it is running on and ta
               ┌───────┴────────┐    ┌────────┴────────┐
               │  server.py     │    │  server_mac.py   │
               │  COM Bridge    │    │  AppleScript     │
-              │  (29 tools)    │    │  Bridge          │
-              │                │    │  (22 tools)      │
+              │  (39 tools)    │    │  Bridge          │
+              │                │    │  (32 tools)      │
               └───────┬────────┘    └────────┬─────────┘
                       |                      |
               OUTLOOK.EXE via         Microsoft Outlook
@@ -62,7 +62,7 @@ The server is structured as two parallel implementations with identical tool nam
 
 ### Windows
 
-- **Outlook Desktop (Classic)** — the `OUTLOOK.EXE` that comes with Microsoft 365 / Office. The new "modern" Outlook (`olk.exe`) does **not** support COM
+- **Outlook Desktop (Classic)** — the `OUTLOOK.EXE` that comes with Microsoft 365 / Office **or Office 2019**. The new "modern" Outlook (`olk.exe`) does **not** support COM. For **offline / intranet-only Office 2019**, see [Office 2019 — offline and air-gapped deployment](#office-2019--offline-and-air-gapped-deployment).
 - **Python 3.12+** (x64 or ARM64)
 - **Outlook must be running** when the MCP server starts
 
@@ -107,6 +107,106 @@ The first time a tool runs, macOS will show **two permission prompts** that you 
 
 Both permissions are one-time setup — macOS remembers them for future sessions.
 
+## Office 2019 — offline and air-gapped deployment
+
+This section is for **Microsoft Office 2019 (16.0) with Outlook Desktop (Classic)** on Windows in **offline, intranet-only, or air-gapped** environments. The MCP server does not call Microsoft Graph; it drives the **locally running** `OUTLOOK.EXE` via COM and reads whatever Outlook has already cached on disk.
+
+### What works offline
+
+| Capability | Offline behavior |
+|------------|------------------|
+| Mail, calendar, tasks, drafts | Works against the **local store / OST** for the signed-in mailbox |
+| Attachments | Read/save from cached items (paths must be allowed by your policy) |
+| `list_contacts` / `search_contacts` | Scans the **Contacts folder** in the selected store (not the full GAL) |
+| `resolve_recipient` | Uses Outlook **CreateRecipient/Resolve** → **Global Address List (GAL)** when the **Offline Address Book (OAB)** is present; otherwise falls back to the Contacts folder |
+
+You still need **Outlook running** and **at least one successful sign-in** so profiles, stores, and (for Exchange) the OST exist. Pure “never connected” installs have no mailbox data to automate.
+
+### Use Classic Outlook, not “New Outlook”
+
+Office 2019 ships **Outlook Desktop (Classic)** — `OUTLOOK.EXE` with COM automation. The separate **New Outlook** (`olk.exe`) does **not** expose the Object Model this project uses. In *File → Office Account*, confirm you are not switched to New Outlook.
+
+Registry and Group Policy paths for security settings use the **16.0** hive (Office 2016 and later share this major version), for example:
+
+`HKLM\Software\Policies\Microsoft\Office\16.0\Outlook\Security`
+
+The bundled policy file [`docs/suppress-outlook-oom-prompts.reg`](docs/suppress-outlook-oom-prompts.reg) targets that path and applies to **Office 2019**.
+
+### Step 1 — Allow programmatic access (required)
+
+Before any tool touches mail or the address book, Outlook may block COM with the **Programmatic Access** / Object Model Guard dialog. On locked-down or offline PCs this often surfaces as COM **`0x80020009`** (*DISP_E_EXCEPTION*) on contact search or GAL resolve.
+
+Configure one of these (details in [Outlook "Programmatic Access" security prompts](#outlook-programmatic-access-security-prompts) above):
+
+1. Approve the prompt when it appears (short-lived).
+2. Set Trust Center **Antivirus status** to **Valid** and enable *Never warn me about suspicious activity* (when your environment allows it).
+3. Import [`docs/suppress-outlook-oom-prompts.reg`](docs/suppress-outlook-oom-prompts.reg) from an **elevated** shell, then restart Outlook completely.
+
+On **MDM/Intune-managed** machines, user registry may be read-only; ask IT to deploy the same `16.0\Outlook\Security` policy keys via Group Policy.
+
+### Step 2 — Sync the Offline Address Book (for `resolve_recipient`)
+
+Corporate name resolution (`resolve_recipient`, meeting attendees) depends on the **GAL** copy Outlook keeps locally:
+
+1. Connect to the corporate network (or VPN) at least once, or use your org’s approved OAB distribution point.
+2. In Outlook: **Send/Receive → Download Address Book** (wording may vary by language pack).
+3. Confirm **File → Account Settings → Address Books** lists an offline address book for your Exchange account.
+
+Without a current OAB, `resolve_recipient` may return `"resolved": false` with a `gal_error` mentioning address-book access — even when **Contacts** search works.
+
+### Step 3 — Contacts folder vs GAL (tool expectations)
+
+| Tool | Data source | Offline tip |
+|------|-------------|-------------|
+| `list_contacts` | **Contacts** folder only | Populate contacts in Outlook or sync from your org’s contact source |
+| `search_contacts` | **Contacts** folder only (DASL `Restrict`) | If search fails with `0x80020009`, fix programmatic access first; ensure the Contacts folder is not empty |
+| `resolve_recipient` | **GAL** via `CreateRecipient`, then **Contacts** fallback | Requires OAB for directory names; use full SMTP (`user@domain`) when you already know the address |
+
+**Caching:** Successful contact results are cached in the MCP process for **7 days** (256 entries, LRU). After bulk contact or OAB updates, **restart the MCP server** (and Claude Code session) so tools see fresh data.
+
+### Step 4 — Multi-mailbox / multi-store (optional)
+
+If you have several accounts in one Outlook profile, pass the `account` argument (substring of the display name from `list_accounts`) on contact tools so the server targets the correct **store**. Mail tools use folder names; drafts and some item lookups may need consistent `entry_id` + store context on multi-store profiles.
+
+### Common COM errors (Office 2019 offline)
+
+| HRESULT | Typical cause | What to do |
+|---------|---------------|------------|
+| `0x80020009` | DASL `Restrict` or address-book COM call rejected | Trust Center programmatic access; sync OAB; retry after Outlook restart |
+| `0x80070005` / `0x80004005` | Access denied on address information | Approve the programmatic access prompt for address data |
+| `0x8004010F` | Stale `entry_id` after move/delete | Re-list the folder and use a fresh ID |
+| `0x80010108` | Outlook RPC disconnected | Quit `OUTLOOK.EXE` (Task Manager), reopen, restart MCP |
+
+Error text from tools includes short hints when the server recognizes these codes.
+
+### Verification checklist (before using MCP in production)
+
+Run on the **same Windows user session** that will host Claude Code / the MCP server:
+
+1. **Outlook Classic** is open and the correct mailbox is selected.
+2. **Programmatic access** is approved (no repeated OOM guard dialogs on send/read).
+3. **OAB** downloaded if you rely on `resolve_recipient` for directory names.
+4. **Contacts** folder contains expected people (for `search_contacts` / local fallback).
+5. Optional integration smoke test (machine with Outlook):
+
+   ```powershell
+   set RUN_OUTLOOK_INTEGRATION=1
+   pytest tests/contacts_mcp_test.py tests/drafts_mcp_test.py -q
+   ```
+
+   **GitHub Actions:** Hosted runners cannot run these tests (no Office). Use a
+   [self-hosted Windows runner with Office 2019](docs/office2019-self-hosted-runner.md)
+   and workflow **Integration (Office 2019 / self-hosted)**. Monitor runs with
+   `scripts/watch-integration-office2019.sh` or `gh run watch`.
+
+### What this project does *not* solve offline
+
+- **No Graph / OAuth** — cannot reach cloud APIs when the network is down; only local Outlook state.
+- **No replacement for Exchange connectivity** — sending meeting invites to unresolved GAL names still requires Outlook to resolve attendees.
+- **No bypass of IT security policy** — if Group Policy blocks programmatic access, registry merges may be reverted; work with administrators.
+
+For development setup and CI, see [CONTRIBUTING.md](CONTRIBUTING.md). For suppressing security prompts via policy, see [`docs/suppress-outlook-oom-prompts.reg`](docs/suppress-outlook-oom-prompts.reg).
+
 ## Available Tools by Platform
 
 ### Email
@@ -116,7 +216,7 @@ Both permissions are one-time setup — macOS remembers them for future sessions
 | `send_email` | yes | yes | Send an email with To/CC/BCC, plain text or HTML body |
 | `list_emails` | yes | yes | List recent emails from any folder, with optional unread filter |
 | `read_email` | yes | yes | Read full email content by entry ID or subject search |
-| `search_emails` | yes | yes | Full-text search across email subjects and bodies |
+| `search_emails` | yes | yes* | Search subjects + bodies (Windows). macOS scans subjects only. |
 | `reply_email` | yes | yes | Reply or reply-all, preserving the conversation thread |
 | `mark_as_read` | yes | yes | Mark a specific email as read |
 | `mark_as_unread` | yes | yes | Mark a specific email as unread |
@@ -153,6 +253,38 @@ Both permissions are one-time setup — macOS remembers them for future sessions
 | `list_attachments` | yes | yes | List all attachments on an email or calendar event |
 | `save_attachment` | yes | yes | Download an attachment to a local directory |
 
+### Drafts (rich text + inline images)
+
+| Tool | Windows | macOS | Description |
+|------|:-------:|:-----:|-------------|
+| `list_drafts` | yes | yes | List unsent drafts, sorted by last modified |
+| `get_draft` | yes | yes | Read a draft including HTML body and attachment metadata |
+| `create_draft` | yes | yes* | Save a new draft with optional HTML body and inline images |
+| `update_draft` | yes | yes* | Edit fields, body, or attachments on an existing draft |
+| `send_draft` | yes | yes | Send a previously saved draft |
+| `delete_draft` | yes | yes | Permanently delete a draft |
+
+`create_draft` / `update_draft` accept:
+
+- `body` (plain text, always saved as fallback)
+- `html_body` (rich HTML — supports formatting, tables, links, etc.)
+- `inline_images`: list of file paths or `{"path": "/abs/x.png", "cid": "logo1", "placeholder": "{{LOGO}}"}` dicts. The HTML may reference them via `<img src="cid:logo1">` or `{{LOGO}}` placeholders. Unreferenced images are appended at the end of the body.
+- `attachments`: list of file paths for ordinary (non-inline) attachments.
+
+\*On Outlook for Mac, inline images are added as ordinary attachments — AppleScript cannot reliably set the per-attachment Content-ID required for true inline rendering. Recipients will see them as separate attachments.
+
+### Contacts (address book)
+
+| Tool | Windows | macOS | Description |
+|------|:-------:|:-----:|-------------|
+| `list_contacts` | yes | yes* | List items from the **Contacts folder** (sorted A–Z) |
+| `search_contacts` | yes | yes* | Search **Contacts folder** by name/email (not full GAL) |
+| `resolve_recipient` | yes | yes* | Resolve a name to email; **Windows uses GAL** via COM |
+
+**Caching:** Successful results are cached in memory for **7 days** (max **256** entries, LRU eviction). Failed resolutions and empty macOS results are not cached. Restart the MCP server to refresh after editing contacts.
+
+\*macOS: AppleScript `contacts` only; scans up to **500** (list) or **1000** (search/resolve) local contacts. No GAL. If AppleScript contacts are unavailable, tools return a clear error.
+
 ### Categories, Rules, Out of Office (Windows only)
 
 These tools rely on COM-specific APIs (MAPI property accessors, the Rules object model, and the Categories collection) that Outlook for Mac does not expose through AppleScript.
@@ -165,7 +297,7 @@ These tools rely on COM-specific APIs (MAPI property accessors, the Rules object
 | `toggle_rule` | yes | — | Enable or disable a mail rule by name |
 | `get_out_of_office` | yes | — | Check whether Out of Office auto-reply is on or off |
 
-**Total: 29 tools on Windows, 22 tools on macOS.**
+**Total: 39 tools on Windows, 31 tools on macOS** (including 6 new draft tools on each platform).
 
 ## Architecture Details
 
@@ -300,8 +432,8 @@ Windows-only examples:
 outlook-desktop-mcp/
   src/outlook_desktop_mcp/
     entrypoint.py            # Platform detection → routes to correct server
-    server.py                # Windows MCP server (29 tools, COM automation)
-    server_mac.py            # macOS MCP server (22 tools, AppleScript)
+    server.py                # Windows MCP server (39 tools, COM automation)
+    server_mac.py            # macOS MCP server (32 tools, AppleScript)
     com_bridge.py            # Async-to-COM threading bridge (Windows)
     applescript_bridge.py    # Async osascript execution (macOS)
     tools/

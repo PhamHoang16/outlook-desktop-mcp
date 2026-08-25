@@ -1,0 +1,47 @@
+# Legacy manual workflow on windows-latest (no Office installed — preflight only).
+# For real Office 2019 tests use: integration-office2019.yml + self-hosted runner.
+# See docs/office2019-self-hosted-runner.md
+name: Integration (Outlook)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  integration:
+    name: Integration (Windows / Outlook)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package with dev dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Check for Classic Outlook
+        id: outlook
+        shell: pwsh
+        run: |
+          $paths = @(
+            "${env:ProgramFiles}\Microsoft Office\root\Office16\OUTLOOK.EXE",
+            "${env:ProgramFiles(x86)}\Microsoft Office\root\Office16\OUTLOOK.EXE"
+          )
+          if ($paths | Where-Object { Test-Path $_ }) {
+            echo "present=true" >> $env:GITHUB_OUTPUT
+          } else {
+            echo "present=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Run Outlook integration tests
+        if: steps.outlook.outputs.present == 'true'
+        env:
+          RUN_OUTLOOK_INTEGRATION: "1"
+        run: python -m pytest tests/contacts_mcp_test.py tests/drafts_mcp_test.py -q
+
+      - name: Skip (no Outlook on hosted runner)
+        if: steps.outlook.outputs.present != 'true'
+        shell: pwsh
+        run: |
+          Write-Host "::notice::Use integration-office2019.yml with a self-hosted runner. See docs/office2019-self-hosted-runner.md"

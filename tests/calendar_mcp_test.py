@@ -3,13 +3,14 @@ Outlook Desktop MCP - Calendar MCP Test
 =========================================
 Uses the MCP SDK client to test all calendar tools through the MCP protocol.
 """
-import sys
-import os
 import json
 import asyncio
 import logging
+import os
+import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(_REPO_ROOT, "src"))
 logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
 
 
@@ -21,11 +22,11 @@ async def run_tests():
     from mcp.client.stdio import stdio_client, StdioServerParameters
     from mcp.client.session import ClientSession
 
-    python_exe = r"C:\Development_Local\outlook-desktop-mcp\.venv\Scripts\python.exe"
     server_params = StdioServerParameters(
-        command=python_exe,
+        command=sys.executable,
         args=["-m", "outlook_desktop_mcp.server"],
-        cwd=r"C:\Development_Local\outlook-desktop-mcp",
+        cwd=_REPO_ROOT,
+        env={**os.environ, "PYTHONPATH": os.path.join(_REPO_ROOT, "src")},
     )
 
     log("=" * 60)

@@ -5,9 +5,20 @@ on:
     branches: [main]
 
 jobs:
+  unit:
+    name: Unit tests gate
+    uses: ./.github/workflows/test.yml
+
+  security:
+    name: Security gate
+    uses: ./.github/workflows/security.yml
+
   publish:
+    needs: [unit, security]
     runs-on: ubuntu-latest
-    environment: main
+    # No GitHub Environment — OIDC `sub` is repo:OWNER/REPO:ref:refs/heads/main.
+    # Configure PyPI Trusted Publisher without an environment name (see
+    # docs/pypi-trusted-publishing.md). Older revisions used environment: main.
     permissions:
       id-token: write
       contents: read
@@ -19,10 +30,35 @@ jobs:
           python-version: "3.12"
 
       - name: Install build tools
-        run: pip install build
+        run: pip install build packaging requests
+
+      - name: Verify version bump
+        run: |
+          python - <<'PY'
+          import json, sys, urllib.request
+          import tomllib
+          from packaging.version import Version
+
+          with open("pyproject.toml", "rb") as f:
+              local = Version(tomllib.load(f)["project"]["version"])
+          try:
+              with urllib.request.urlopen("https://pypi.org/pypi/outlook-desktop-mcp/json", timeout=15) as r:
+                  pypi_version = Version(json.load(r)["info"]["version"])
+          except Exception as e:
+              print(f"Could not fetch PyPI metadata ({e}); skipping bump check.")
+              sys.exit(0)
+          if local <= pypi_version:
+              print(f"Refusing to publish: pyproject version {local} is not greater than PyPI {pypi_version}.", file=sys.stderr)
+              sys.exit(1)
+          print(f"Version bump OK: {pypi_version} -> {local}")
+          PY
 
       - name: Build package
         run: python -m build
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Optional: set repository secret PYPI_API_TOKEN if Trusted Publishing
+          # is not configured yet (see docs/pypi-trusted-publishing.md).
+          password: ${{ secrets.PYPI_API_TOKEN }}
