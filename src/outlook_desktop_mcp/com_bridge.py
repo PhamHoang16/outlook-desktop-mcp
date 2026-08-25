@@ -16,6 +16,12 @@ is still in flight (the COM thread cannot be cancelled mid-COM-call).
 When Outlook crashes or is force-closed, the cached ``Outlook.Application``
 and ``MAPI`` namespace references become RPC-disconnected. The bridge
 detects those errors and re-Dispatches once before propagating the failure.
+
+Connecting to Outlook is *lazy*: ``start()`` only brings the COM thread up,
+and the first queued call performs the Dispatch. This keeps the MCP server
+startable when Outlook is not running yet, and avoids touching the Exchange
+address book at startup — some corporate security policies block
+``Namespace.CurrentUser``, which used to abort startup with E_ABORT.
 """
 import asyncio
 import logging
@@ -37,6 +43,7 @@ _RPC_DISCONNECTED_HRESULTS = frozenset({
     0x800706BE,  # remote procedure call failed
     0x80010105,  # RPC_E_SERVERFAULT
     0x800706BF,  # RPC failed, did not execute
+    0x800401FD,  # CO_E_OBJNOTCONNECTED
 })
 
 
@@ -91,14 +98,33 @@ class OutlookBridge:
         self._ready = threading.Event()
         self._shutdown = threading.Event()
         self._init_error: Exception | None = None
+        self._alive = threading.Event()
         self._in_flight_lock = threading.Lock()
         self._in_flight_label: str | None = None
 
     def start(self, timeout: float = DEFAULT_START_TIMEOUT):
-        """Start the COM thread. Call once at server startup."""
+        """Start the COM thread. Call once at server startup.
+
+        Waits only for the COM apartment to initialize — not for a connection
+        to Outlook. Outlook is Dispatched lazily on the first queued call, so
+        this succeeds even when Outlook is not running yet.
+        """
         if self._thread is not None and self._thread.is_alive():
             logger.warning("OutlookBridge.start() called twice; ignoring.")
             return
+        # Reset state so a restart after stop() behaves like a fresh start.
+        self._shutdown.clear()
+        self._ready.clear()
+        self._alive.clear()
+        self._init_error = None
+        # A fresh thread means a fresh COM apartment; any cached proxy from a
+        # previous thread is invalid.
+        self._outlook = None
+        self._namespace = None
+        # Drop requests left over from a previous lifecycle so they do not
+        # re-execute on the new thread.
+        self._drain_pending("COM bridge restarted before this request ran")
+
         self._thread = threading.Thread(
             target=self._com_thread_main, daemon=True, name="outlook-com"
         )
@@ -107,9 +133,36 @@ class OutlookBridge:
             if self._init_error:
                 raise self._init_error
             raise RuntimeError(
-                f"Outlook COM thread failed to initialize within {timeout}s. "
-                "Is Outlook Desktop (Classic) running?"
+                f"Outlook COM thread failed to initialize within {timeout}s."
             )
+        if self._init_error:
+            raise self._init_error
+
+    def _connect(self) -> None:
+        """Dispatch Outlook.Application and cache the MAPI namespace.
+
+        Runs on the COM thread only. Deliberately touches nothing beyond
+        Dispatch + GetNamespace: reading ``DefaultStore`` or ``CurrentUser``
+        here hits the Exchange address book, which corporate policy can block
+        with E_ABORT and which used to make startup fail outright.
+
+        Never leaves a half-set _outlook/_namespace pair behind.
+        """
+        import win32com.client
+
+        try:
+            outlook = win32com.client.Dispatch("Outlook.Application")
+            namespace = outlook.GetNamespace("MAPI")
+        except Exception as e:
+            self._outlook = None
+            self._namespace = None
+            raise ComBridgeDisconnectedError(
+                "Could not connect to Outlook Desktop (Classic). Open Outlook "
+                "and retry. The new Outlook (olk.exe) does not support COM."
+            ) from e
+        self._outlook = outlook
+        self._namespace = namespace
+        logger.debug("Connected to Outlook via COM")
 
     def _redispatch_outlook(self) -> None:
         """Drop cached references and re-Dispatch Outlook.Application.
@@ -117,17 +170,16 @@ class OutlookBridge:
         Called on the COM thread only, after detecting RPC_E_DISCONNECTED.
         Caller already holds the in-flight lock.
         """
-        import win32com.client
-
         logger.warning("Outlook COM disconnected; attempting re-Dispatch")
         self._outlook = None
         self._namespace = None
-        self._outlook = win32com.client.Dispatch("Outlook.Application")
-        self._namespace = self._outlook.GetNamespace("MAPI")
+        self._connect()
         logger.info("Outlook COM re-Dispatch succeeded")
 
     def _invoke(self, func, args, kwargs):
-        """Run func once; on RPC disconnect, re-Dispatch and retry once."""
+        """Run func once; connect lazily, and on RPC disconnect retry once."""
+        if self._outlook is None:
+            self._connect()
         try:
             return func(self._outlook, self._namespace, *args, **kwargs)
         except Exception as e:
@@ -143,27 +195,24 @@ class OutlookBridge:
             return func(self._outlook, self._namespace, *args, **kwargs)
 
     def _com_thread_main(self):
-        """Main loop for the COM thread."""
+        """Main loop for the COM thread.
+
+        Does NOT connect to Outlook here — see _invoke / _connect. The thread
+        only needs its COM apartment to be ready before it accepts work.
+        """
         import pythoncom
-        import win32com.client
 
-        pythoncom.CoInitialize()
         try:
-            try:
-                self._outlook = win32com.client.Dispatch("Outlook.Application")
-                self._namespace = self._outlook.GetNamespace("MAPI")
-                store_name = self._namespace.DefaultStore.DisplayName
-                user_name = self._namespace.CurrentUser.Name
-                logger.debug(
-                    "COM thread ready. Store: %s, User: %s", store_name, user_name
-                )
-            except Exception as e:
-                self._init_error = e
-                logger.error("COM thread init failed: %s", e)
-                self._ready.set()
-                return
+            pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
+        except Exception as e:
+            self._init_error = e
+            logger.error("COM apartment init failed: %s", e)
             self._ready.set()
+            return
 
+        self._alive.set()
+        self._ready.set()
+        try:
             while not self._shutdown.is_set():
                 try:
                     func, args, kwargs, result_event, result_holder = (
@@ -180,6 +229,7 @@ class OutlookBridge:
 
             self._drain_pending("COM bridge is shutting down")
         finally:
+            self._alive.clear()
             self._outlook = None
             self._namespace = None
             pythoncom.CoUninitialize()
@@ -216,6 +266,19 @@ class OutlookBridge:
         timeout_val = DEFAULT_CALL_TIMEOUT if timeout is None else float(timeout)
         label = getattr(func, "__name__", "<anonymous>")
 
+        # Fail fast rather than making the caller wait out the full timeout
+        # for a thread that is not there to answer.
+        if self._init_error:
+            raise self._init_error
+        if self._thread is None or not self._thread.is_alive():
+            raise ComBridgeDisconnectedError(
+                "COM bridge is not running. Restart the MCP server."
+            )
+        if not self._alive.is_set():
+            raise ComBridgeDisconnectedError(
+                "COM thread exited unexpectedly. Restart the MCP server."
+            )
+
         if not self._in_flight_lock.acquire(blocking=False):
             raise ComBridgeBusyError(
                 f"COM thread is busy with previous request "
@@ -248,6 +311,7 @@ class OutlookBridge:
     def stop(self):
         """Signal the COM thread to shut down and reject pending requests."""
         self._shutdown.set()
+        self._alive.clear()
         self._drain_pending("OutlookBridge stopped")
         if self._thread:
             self._thread.join(timeout=5)
